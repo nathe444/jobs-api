@@ -56,15 +56,20 @@ function isValidApplyUrl(url) {
 // Helper function to normalize salary data
 function normalizeSalary(job) {
   const raw = job.salary_raw ?? job.salary ?? job.compensation ?? null;
+  const aiCurrency = job.ai_salary_currency ?? null;
+  const aiValue = job.ai_salary_value ?? null;
+  const aiMin = job.ai_salary_minvalue ?? null;
+  const aiMax = job.ai_salary_maxvalue ?? null;
+  const aiUnit = job.ai_salary_unittext ?? null;
   const rawIsObject = raw && typeof raw === 'object' && !Array.isArray(raw);
   const monetaryValue = rawIsObject ? raw.value : null;
   const valueIsObject = monetaryValue && typeof monetaryValue === 'object' && !Array.isArray(monetaryValue);
 
-  const min = job.salary_min ?? job.salary_min_derived ?? job.salary_range_min ?? job.salary_from ?? (valueIsObject ? monetaryValue.minValue : null);
-  const max = job.salary_max ?? job.salary_max_derived ?? job.salary_range_max ?? job.salary_to ?? (valueIsObject ? monetaryValue.maxValue : null);
+  const min = job.salary_min ?? job.salary_min_derived ?? job.salary_range_min ?? job.salary_from ?? (valueIsObject ? monetaryValue.minValue : null) ?? aiMin;
+  const max = job.salary_max ?? job.salary_max_derived ?? job.salary_range_max ?? job.salary_to ?? (valueIsObject ? monetaryValue.maxValue : null) ?? aiMax;
   const value = valueIsObject ? monetaryValue.value : null;
-  const currency = job.salary_currency ?? job.currency ?? job.compensation_currency ?? (rawIsObject ? raw.currency : null);
-  const period = job.salary_period ?? job.salary_unit ?? job.compensation_period ?? (valueIsObject ? monetaryValue.unitText : null);
+  const currency = job.salary_currency ?? job.currency ?? job.compensation_currency ?? (rawIsObject ? raw.currency : null) ?? aiCurrency;
+  const period = job.salary_period ?? job.salary_unit ?? job.compensation_period ?? (valueIsObject ? monetaryValue.unitText : null) ?? aiUnit;
 
   const toNumber = (value) => {
     if (value === null || value === undefined) return null;
@@ -74,7 +79,7 @@ function normalizeSalary(job) {
     return Number.isFinite(parsed) ? parsed : null;
   };
 
-  const minNum = toNumber(min ?? value);
+  const minNum = toNumber(min ?? value ?? aiValue);
   const maxNum = toNumber(max);
 
   if (minNum || maxNum || currency || period) {
@@ -105,10 +110,13 @@ function fetchJobs() {
       'X-RapidAPI-Host': 'active-jobs-db.p.rapidapi.com'
     },
     params: {
-      limit: 100,
+      limit: 150,
       offset: 0,
       title_filter: 'cybersecurity',
-      description_type: 'text'
+      description_type: 'text',
+      remote: true,
+      include_ai: true,
+      ai_has_salary: true
     }
   });
 }
@@ -150,14 +158,7 @@ async function syncJobs() {
   }
   
   // Filter jobs
-  const filteredJobs = jobs.filter(job => {
-    const hasTitle = job.title;
-    const hasOrg = job.organization;
-    const hasUrl = job.url;
-    const isCyber = isCybersecurityJob(job);
-    const isValidUrl = isValidApplyUrl(job.url);
-    return hasTitle && hasOrg && hasUrl && isCyber && isValidUrl;
-  });
+  const filteredJobs = jobs;
   
   console.log(`Filtered to ${filteredJobs.length} cybersecurity jobs`);
   

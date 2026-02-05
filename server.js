@@ -29,6 +29,130 @@ const EXCLUDE_KEYWORDS = [
   'physical security', 'security guard', 'surveillance'
 ];
 
+const ORG_LOGO_SIZE = 256;
+
+function extractDomain(inputUrl) {
+  if (!inputUrl) return null;
+  try {
+    const parsed = new URL(inputUrl);
+    return parsed.hostname.replace(/^www\./, '');
+  } catch {
+    return null;
+  }
+}
+
+function buildFaviconUrl(domain) {
+  if (!domain) return null;
+  return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=${ORG_LOGO_SIZE}`;
+}
+
+const SERPAPI_KEY = (process.env.SERPAPI_KEY || '').trim();
+const COMPANY_ENRICH_API_KEY = (process.env.COMPANY_ENRICH_API_KEY || '').trim();
+
+async function fetchOrganizationUrlFromSerpApi(organization) {
+  if (!SERPAPI_KEY || !organization) return null;
+  try {
+    const response = await axios.get('https://serpapi.com/search.json', {
+      params: {
+        q: `${organization} official website`,
+        engine: 'google',
+        api_key: SERPAPI_KEY,
+        num: 3
+      }
+    });
+
+    const organic = response.data?.organic_results || [];
+    const firstLink = organic.find(item => item?.link)?.link || null;
+    return firstLink;
+  } catch (error) {
+    const status = error.response?.status;
+    const message = error.response?.data?.error || error.message;
+    console.warn('SerpAPI lookup failed:', status || '', message);
+    return null;
+  }
+}
+
+async function resolveOrganizationUrls(job) {
+  const orgUrl = job.organization_url || null;
+  const orgDomain = extractDomain(orgUrl);
+  const logoFromOrgUrl = buildFaviconUrl(orgDomain);
+
+  if (orgUrl || !SERPAPI_KEY) {
+    return {
+      organizationUrl: orgUrl,
+      organizationLogoUrl: job.organization_logo || logoFromOrgUrl
+    };
+  }
+
+  const serpOrgUrl = await fetchOrganizationUrlFromSerpApi(job.organization || '');
+  const serpDomain = extractDomain(serpOrgUrl);
+  const serpLogoUrl = buildFaviconUrl(serpDomain);
+
+  return {
+    organizationUrl: serpOrgUrl,
+    organizationLogoUrl: job.organization_logo || serpLogoUrl
+  };
+}
+
+async function fetchCompanyDetails(companyDomain) {
+  if (!COMPANY_ENRICH_API_KEY || !companyDomain) return null;
+  try {
+    const response = await axios.get('https://api.companyenrich.com/companies/enrich', {
+      params: { domain: companyDomain },
+      headers: {
+        Authorization: `Bearer ${COMPANY_ENRICH_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    return response.data || null;
+  } catch (error) {
+    const status = error.response?.status;
+    const message = error.response?.data || error.message;
+    console.warn('CompanyEnrich lookup failed:', status || '', message);
+    return null;
+  }
+}
+
+async function upsertCompanyByOrganizationUrl(organizationUrl, companyName, companyDomain) {
+  if (!organizationUrl) return;
+
+  const companyData = await fetchCompanyDetails(companyDomain);
+
+  const locationParts = [
+    companyData?.location?.address,
+    companyData?.location?.city?.name,
+    companyData?.location?.state?.name,
+    companyData?.location?.country?.name
+  ].filter(Boolean);
+
+  const payload = {
+    organization_url: organizationUrl,
+    company_name: companyData?.name
+      ? String(companyData.name).substring(0, 100)
+      : (companyName ? companyName.substring(0, 100) : null),
+    about: companyData?.description || null,
+    founded_year: companyData?.founded_year
+      ? new Date(`${companyData.founded_year}-01-01`).toISOString().split('T')[0]
+      : null,
+    industries: companyData?.industries || (companyData?.industry ? [companyData.industry] : null),
+    socials: companyData?.socials || null,
+    logo_url: companyData?.logo_url || null,
+    location: locationParts.length ? locationParts.join(', ') : null,
+    long_description: companyData?.seo_description || null,
+    size: companyData?.employees || null,
+    website: companyData?.website || null,
+    updated_at: new Date().toISOString()
+  };
+
+  const { error } = await supabase
+    .from('companies')
+    .upsert(payload, { onConflict: 'organization_url' });
+
+  if (error) {
+    console.warn('Company upsert failed:', error.message);
+  }
+}
+
 // Helper function to check if job is cybersecurity-related
 function isCybersecurityJob(job) {
   const text = `${job.title || ''} ${job.description_text || ''}`.toLowerCase();
@@ -162,22 +286,42 @@ async function syncJobs() {
   
   console.log(`Filtered to ${filteredJobs.length} cybersecurity jobs`);
   
+  const processedCompanies = new Set();
+
   // Normalize and prepare for database
-  const normalizedJobs = filteredJobs.map(job => ({
-    title: job.title.substring(0, 255),
-    company: job.organization.substring(0, 100),
-    location: job.locations_alt_raw?.[0] || 'Remote',
-    is_remote: job.location_type === 'TELECOMMUTE' || job.remote_derived === true,
-    apply_url: job.url,
-    source: job.source || 'active-jobs-db',
-    external_job_id: job.id?.toString() || Math.random().toString(),
-    posted_at: new Date(job.date_posted || job.date_created || new Date()).toISOString(),
-    last_updated: new Date(job.date_created || new Date()).toISOString(),
-    salary: normalizeSalary(job),
-    job_type: job.employment_type?.[0] || 'FULL_TIME',
-    description_snippet: job.description_text?.substring(0, 1000) || null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
+  const normalizedJobs = await Promise.all(filteredJobs.map(async (job) => {
+    const { organizationUrl, organizationLogoUrl } = await resolveOrganizationUrls(job);
+
+    const companyName = job.organization?.substring(0, 100) || null;
+    const companyDomain = job.domain_derived
+      || extractDomain(organizationUrl)
+      || null;
+
+    if (organizationUrl && !processedCompanies.has(organizationUrl)) {
+      processedCompanies.add(organizationUrl);
+      if (companyDomain) {
+        await upsertCompanyByOrganizationUrl(organizationUrl, companyName, companyDomain);
+      }
+    }
+
+    return {
+      title: job.title.substring(0, 255),
+      company: companyName,
+      location: job.locations_alt_raw?.[0] || 'Remote',
+      is_remote: job.location_type === 'TELECOMMUTE' || job.remote_derived === true,
+      apply_url: job.url,
+      source: job.source || 'active-jobs-db',
+      external_job_id: job.id?.toString() || Math.random().toString(),
+      posted_at: new Date(job.date_posted || job.date_created || new Date()).toISOString(),
+      last_updated: new Date(job.date_created || new Date()).toISOString(),
+      salary: normalizeSalary(job),
+      job_type: job.employment_type?.[0] || 'FULL_TIME',
+      description_snippet: job.description_text?.substring(0, 1000) || null,
+      organization_url: organizationUrl,
+      organization_logo_url: organizationLogoUrl,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
   }));
   
   // Upsert into database (prevents duplicates based on external_job_id)

@@ -153,6 +153,29 @@ async function upsertCompanyByOrganizationUrl(organizationUrl, companyName, comp
   }
 }
 
+async function updateCompanyJobsCount(organizationUrl) {
+  if (!organizationUrl) return;
+
+  const { count, error: countError } = await supabase
+    .from('jobs')
+    .select('id', { count: 'exact', head: true })
+    .eq('organization_url', organizationUrl);
+
+  if (countError) {
+    console.warn('Jobs count failed:', countError.message);
+    return;
+  }
+
+  const { error: updateError } = await supabase
+    .from('companies')
+    .update({ jobs_count: count || 0, updated_at: new Date().toISOString() })
+    .eq('organization_url', organizationUrl);
+
+  if (updateError) {
+    console.warn('Jobs count update failed:', updateError.message);
+  }
+}
+
 // Helper function to check if job is cybersecurity-related
 function isCybersecurityJob(job) {
   const text = `${job.title || ''} ${job.description_text || ''}`.toLowerCase();
@@ -334,6 +357,8 @@ async function syncJobs() {
     throw new Error(`Database error: ${error.message}`);
   }
   
+  await Promise.all([...processedCompanies].map(updateCompanyJobsCount));
+
   console.log(`Upserted ${data.length} jobs into database`);
   
   return {

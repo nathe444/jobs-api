@@ -127,9 +127,7 @@ async function upsertCompanyByOrganizationUrl(organizationUrl, companyName, comp
 
   const payload = {
     organization_url: organizationUrl,
-    company_name: companyData?.name
-      ? String(companyData.name).substring(0, 100)
-      : (companyName ? companyName.substring(0, 100) : null),
+    company_name: companyName ? companyName.substring(0, 100) : null,
     about: companyData?.description || null,
     founded_year: companyData?.founded_year
       ? new Date(`${companyData.founded_year}-01-01`).toISOString().split('T')[0]

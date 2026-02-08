@@ -41,6 +41,15 @@ function extractDomain(inputUrl) {
   }
 }
 
+// Generate a URL-friendly slug from a string (only letters, gaps replaced by -)
+function generateSlug(text) {
+  if (!text) return null;
+  return text
+    .toLowerCase()
+    .replace(/[^a-z]+/g, '-')  // Replace any non-letter character(s) with a single -
+    .replace(/^-+|-+$/g, '');   // Remove leading/trailing dashes
+}
+
 function buildFaviconUrl(domain) {
   if (!domain) return null;
   return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=${ORG_LOGO_SIZE}`;
@@ -113,7 +122,7 @@ async function fetchCompanyDetails(companyDomain) {
   }
 }
 
-async function upsertCompanyByOrganizationUrl(organizationUrl, companyName, companyDomain) {
+async function upsertCompanyByOrganizationUrl(organizationUrl, companyName, companyDomain, companySlug) {
   if (!organizationUrl) return;
 
   const companyData = await fetchCompanyDetails(companyDomain);
@@ -128,6 +137,7 @@ async function upsertCompanyByOrganizationUrl(organizationUrl, companyName, comp
   const payload = {
     organization_url: organizationUrl,
     company_name: companyName ? companyName.substring(0, 100) : null,
+    company_slug: companySlug,
     about: companyData?.description || null,
     founded_year: companyData?.founded_year
       ? new Date(`${companyData.founded_year}-01-01`).toISOString().split('T')[0]
@@ -318,16 +328,28 @@ async function syncJobs() {
       || extractDomain(organizationUrl)
       || null;
 
+    // Generate slugs
+    const companySlug = generateSlug(companyName);
+    const jobTitleSlug = generateSlug(job.title);
+    const externalId = job.id?.toString() || Math.random().toString(36).substring(2, 10);
+    const idSuffix = externalId.slice(-8); // Use last 8 chars of external_job_id for uniqueness
+    // Make job_slug unique by combining company_slug, job title slug, and id suffix
+    const jobSlug = companySlug && jobTitleSlug 
+      ? `${companySlug}-${jobTitleSlug}-${idSuffix}` 
+      : `${jobTitleSlug}-${idSuffix}`;
+
     if (organizationUrl && !processedCompanies.has(organizationUrl)) {
       processedCompanies.add(organizationUrl);
       if (companyDomain) {
-        await upsertCompanyByOrganizationUrl(organizationUrl, companyName, companyDomain);
+        await upsertCompanyByOrganizationUrl(organizationUrl, companyName, companyDomain, companySlug);
       }
     }
 
     return {
       title: job.title.substring(0, 255),
       company: companyName,
+      company_slug: companySlug,
+      job_slug: jobSlug,
       location: job.locations_alt_raw?.[0] || 'Remote',
       is_remote: job.location_type === 'TELECOMMUTE' || job.remote_derived === true,
       apply_url: job.url,

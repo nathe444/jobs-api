@@ -57,6 +57,69 @@ function buildFaviconUrl(domain) {
 
 const SERPAPI_KEY = (process.env.SERPAPI_KEY || '').trim();
 const COMPANY_ENRICH_API_KEY = (process.env.COMPANY_ENRICH_API_KEY || '').trim();
+const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
+
+// Job categories for classification
+const JOB_CATEGORIES = [
+  'INTERNSHIPS',
+  'DEVSECOPS',
+  'SECURITY-ENGINEER',
+  'INFOSEC',
+  'ANALYST',
+  'CLOUD-SECURITY',
+  'GRC',
+  'PENETRATION-TESTING',
+  'SALES'
+];
+
+// Rate limiting helper
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Classify job category using Groq API (Llama 3)
+async function classifyJobCategory(title, descriptionSnippet) {
+  if (!GROQ_API_KEY) {
+    return null;
+  }
+
+  const prompt = `Classify this cybersecurity job into exactly ONE category.
+
+Categories: ${JOB_CATEGORIES.join(', ')}
+
+Job Title: ${title || 'N/A'}
+Description: ${(descriptionSnippet || '').substring(0, 500)}
+
+Respond with ONLY the category name, nothing else.`;
+
+  try {
+    const response = await axios.post(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.1,
+        max_tokens: 30
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const rawCategory = response.data?.choices?.[0]?.message?.content?.trim().toUpperCase();
+    
+    // Validate the response is one of our categories
+    const matchedCategory = JOB_CATEGORIES.find(cat => 
+      rawCategory === cat || rawCategory?.includes(cat)
+    );
+
+    return matchedCategory || null;
+  } catch (error) {
+    console.warn('Groq classification failed:', error.response?.data?.error?.message || error.message);
+    return null;
+  }
+}
 
 async function fetchOrganizationUrlFromSerpApi(organization) {
   if (!SERPAPI_KEY || !organization) return null;
@@ -319,8 +382,12 @@ async function syncJobs() {
   
   const processedCompanies = new Set();
 
-  // Normalize and prepare for database
-  const normalizedJobs = await Promise.all(filteredJobs.map(async (job) => {
+  // Normalize and prepare for database (sequential to respect Groq rate limits)
+  const normalizedJobs = [];
+  for (let i = 0; i < filteredJobs.length; i++) {
+    const job = filteredJobs[i];
+    console.log(`Processing job ${i + 1}/${filteredJobs.length}: ${job.title?.substring(0, 50)}`);
+    
     const { organizationUrl, organizationLogoUrl } = await resolveOrganizationUrls(job);
 
     const companyName = job.organization?.substring(0, 100) || null;
@@ -345,11 +412,20 @@ async function syncJobs() {
       }
     }
 
-    return {
+    const fullDescription = job.description_text || null;
+
+    // Classify job category using Groq (with rate limiting - 2 sec between calls for 30 req/min limit)
+    const jobCategory = await classifyJobCategory(job.title, fullDescription);
+    if (GROQ_API_KEY && i < filteredJobs.length - 1) {
+      await delay(2100); // ~28 requests per minute to stay under 30 req/min limit
+    }
+
+    normalizedJobs.push({
       title: job.title.substring(0, 255),
       company: companyName,
       company_slug: companySlug,
       job_slug: jobSlug,
+      category: jobCategory,
       location: job.locations_alt_raw?.[0] || 'Remote',
       is_remote: job.location_type === 'TELECOMMUTE' || job.remote_derived === true,
       apply_url: job.url,
@@ -359,13 +435,13 @@ async function syncJobs() {
       last_updated: new Date(job.date_created || new Date()).toISOString(),
       salary: normalizeSalary(job),
       job_type: job.employment_type?.[0] || 'FULL_TIME',
-      description_snippet: job.description_text?.substring(0, 1000) || null,
+      description_snippet: fullDescription,
       organization_url: organizationUrl,
       organization_logo_url: organizationLogoUrl,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
-    };
-  }));
+    });
+  }
   
   // Upsert into database (prevents duplicates based on external_job_id)
   const { data, error } = await supabase
